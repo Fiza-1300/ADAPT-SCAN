@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from "react"
+import { useState, useEffect, useCallback, useRef, type FormEvent } from "react"
+import { createSession, login, register, saveSimulationResult, startSimulation, stepSimulation, type BackendState } from "./api"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -307,6 +308,38 @@ function getTopCandidates(regions: Region[], step: number): Candidate[] {
     .map(r => ({ id: r.id, utility: computeAdaptUtility(r, step), region: r }))
     .sort((a, b) => b.utility - a.utility)
     .slice(0, 5)
+}
+
+function mapBackendState(state: BackendState): Region[] {
+  return state.regions.map((region, index) => ({
+    id: region.region_id,
+    freqMHz: 100 + index * 250,
+    bwMHz: 41,
+    signalStrength: region.existence,
+    threatLevel: region.threat_relevance,
+    uncertainty: region.uncertainty,
+    beliefProb: region.existence,
+    lastScanned: region.last_observed,
+    signalType: region.status === "detected" ? "RADAR" : "UNKNOWN",
+    active: region.status !== "silent",
+    priority: region.threat_relevance,
+  }))
+}
+
+function buildBackendRecord(state: BackendState): ScanRecord | null {
+  if (!state.decision) return null
+  return {
+    step: state.timestep,
+    regionId: state.decision.selected_action,
+    infoGain: state.decision.information_gain,
+    threatValue: state.decision.threat_score,
+    uncertainty: state.decision.uncertainty,
+    trackingUrgency: state.decision.tracking_value,
+    scanCost: state.decision.scan_cost,
+    detectedSignal: state.observation?.detected ?? false,
+    explanation: state.decision.reason,
+    strategy: "ADAPT_SCAN",
+  }
 }
 
 // ─── Scenario presets ─────────────────────────────────────────────────────────
@@ -1265,7 +1298,59 @@ function OverrideModal({ open, onClose, onConfirm, regions, aiRegion, c }: {
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
+function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => void }) {
+  const [mode, setMode] = useState<"login" | "register">("login")
+  const [name, setName] = useState("")
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [error, setError] = useState("")
+  const [busy, setBusy] = useState(false)
+
+  async function submit(event: FormEvent) {
+    event.preventDefault()
+    setBusy(true)
+    setError("")
+    try {
+      const response = mode === "login"
+        ? await login(email, password)
+        : await register(name, email, password)
+      localStorage.setItem("adapt_scan_token", response.token)
+      onAuthenticated(response.token)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to connect to the backend.")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <main className="min-h-screen flex items-center justify-center bg-[#050d12] px-4 text-[#c8e6f0]">
+      <form onSubmit={submit} className="w-full max-w-md border border-[#1e3a50] bg-[#071018] p-6 shadow-xl">
+        <div className="mb-6">
+          <div className="font-mono text-lg font-bold tracking-widest text-[#00e57a]">ADAPT-SCAN</div>
+          <div className="mt-1 font-mono text-xs tracking-wider text-[#4a7a99]">BACKEND CONNECTION</div>
+        </div>
+        {mode === "register" && (
+          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Name" required className="mb-3 w-full border border-[#1e3a50] bg-[#040b10] p-3 font-mono text-sm outline-none" />
+        )}
+        <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" placeholder="Email" required className="mb-3 w-full border border-[#1e3a50] bg-[#040b10] p-3 font-mono text-sm outline-none" />
+        <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" placeholder="Password" minLength={6} required className="mb-3 w-full border border-[#1e3a50] bg-[#040b10] p-3 font-mono text-sm outline-none" />
+        {error && <div className="mb-3 border border-[#f87171] bg-[#1a0a00] p-3 font-mono text-xs text-[#f87171]">{error}</div>}
+        <button disabled={busy} className="w-full border border-[#00e57a] bg-[#00e57a22] p-3 font-mono text-sm font-bold text-[#00e57a] disabled:opacity-50">
+          {busy ? "CONNECTING..." : mode === "login" ? "LOGIN" : "CREATE ACCOUNT"}
+        </button>
+        <button type="button" onClick={() => { setMode(mode === "login" ? "register" : "login"); setError("") }} className="mt-4 w-full font-mono text-xs text-[#7ab8cc]">
+          {mode === "login" ? "Create a new account" : "Use an existing account"}
+        </button>
+      </form>
+    </main>
+  )
+}
+
 export default function App() {
+  const [token, setToken] = useState(() => localStorage.getItem("adapt_scan_token"))
+  const [backendSimId, setBackendSimId] = useState<string | null>(null)
+  const [backendSessionId, setBackendSessionId] = useState<string | null>(null)
   const [theme, setTheme] = useState<Theme>("dark")
   const [lang, setLang] = useState<Lang>("en")
   const [aiOpen, setAiOpen] = useState(false)
@@ -1296,7 +1381,41 @@ export default function App() {
   const [budgetUsed, setBudgetUsed] = useState(0)
   const [running, setRunning] = useState(false)
   const [candidates, setCandidates] = useState<Candidate[]>([])
+  const [backendError, setBackendError] = useState("")
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const backendRequestRef = useRef(false)
+
+  useEffect(() => {
+    if (!token) return
+    let cancelled = false
+    async function bootBackend() {
+      const session = await createSession(token, {
+        title: `ADAPT-SCAN ${new Date().toLocaleString()}`,
+        scenario: 2,
+        status: "running",
+        summary: "Frontend-connected simulation session",
+      })
+      const state = await startSimulation(token, {
+        sim_id: `frontend-${Date.now()}`,
+        scenario: config.scenario,
+        seed: 42,
+        strategy: config.strategy.toLowerCase(),
+        budget_total: config.scanBudget,
+      })
+      if (cancelled) return
+      setBackendSessionId(session.session._id)
+      setBackendSimId(state.sim_id)
+      setRegions(mapBackendState(state))
+      setStep(state.timestep)
+      setBudgetUsed(state.budget_total - state.budget_remaining)
+      setRunning(true)
+      setBackendError("")
+    }
+    bootBackend().catch(error => {
+      if (!cancelled) setBackendError(error instanceof Error ? error.message : "Backend simulation could not start.")
+    })
+    return () => { cancelled = true }
+  }, [token])
 
   // Elapsed timer
   useEffect(() => {
@@ -1315,7 +1434,62 @@ export default function App() {
     setDecisionEvents(evs => [...evs, { id: eventIdRef.current++, step, elapsed: Math.floor(runSecsRef.current), type: "event", regionId: "", label: msg }])
   }
 
+  const applyBackendStep = useCallback((state: BackendState) => {
+    const nextRegions = mapBackendState(state)
+    const record = buildBackendRecord(state)
+    setRegions(nextRegions)
+    setStep(state.timestep)
+    setBudgetUsed(state.budget_total - state.budget_remaining)
+    setScanningId(null)
+    setCandidates(getTopCandidates(nextRegions, state.timestep))
+    if (record) {
+      setCurrentRecord(record)
+      setHistory(historyItems => [record, ...historyItems].slice(0, 60))
+      setDecisionEvents(events => [...events, {
+        id: eventIdRef.current++, step: state.timestep, elapsed: Math.floor(runSecsRef.current),
+        type: "ai", regionId: record.regionId,
+        label: `Backend selected ${record.regionId} — ${record.detectedSignal ? "HIT" : "NIL"}`,
+        detected: record.detectedSignal, record,
+      }])
+    }
+  }, [])
+
+  const runBackendStep = useCallback(async () => {
+    if (!token || !backendSimId || backendRequestRef.current) return
+    backendRequestRef.current = true
+    try {
+      setScanningId("backend")
+      const state = await stepSimulation(token, backendSimId)
+      applyBackendStep(state)
+      const record = buildBackendRecord(state)
+      if (backendSessionId && record) {
+        void saveSimulationResult(token, backendSessionId, {
+          region: record.regionId,
+          strategy: record.strategy,
+          confidence: record.detectedSignal ? 1 : 0,
+          metrics: {
+            information_gain: record.infoGain,
+            threat_value: record.threatValue,
+            uncertainty: record.uncertainty,
+            tracking_urgency: record.trackingUrgency,
+            scan_cost: record.scanCost,
+          },
+        }).catch(error => setBackendError(error instanceof Error ? error.message : "Unable to save simulation result."))
+      }
+      setBackendError("")
+    } catch (error) {
+      setRunning(false)
+      setBackendError(error instanceof Error ? error.message : "Backend simulation step failed.")
+    } finally {
+      backendRequestRef.current = false
+    }
+  }, [applyBackendStep, backendSessionId, backendSimId, token])
+
   const tick = useCallback(() => {
+    if (token && backendSimId) {
+      void runBackendStep()
+      return
+    }
     setStep(s => {
       const nextStep = s + 1
       setRegions(prev => {
@@ -1369,7 +1543,7 @@ export default function App() {
       })
       return nextStep
     })
-  }, [config])
+  }, [backendSimId, config, runBackendStep, token])
 
   useEffect(() => {
     if (!running) { if (timerRef.current) clearInterval(timerRef.current); return }
@@ -1424,6 +1598,8 @@ export default function App() {
 
   const LANG_LABELS: Record<Lang, string> = { en: "EN", hi: "हि", fr: "FR", es: "ES", de: "DE" }
   const LANG_NAMES: Record<Lang, string> = { en: "English", hi: "हिंदी", fr: "Français", es: "Español", de: "Deutsch" }
+
+  if (!token) return <AuthScreen onAuthenticated={setToken} />
 
   return (
     <div className="h-screen w-full flex flex-col overflow-hidden" style={{ background: c.bg, color: c.textPrimary, fontFamily: "'Inter', sans-serif" }}
