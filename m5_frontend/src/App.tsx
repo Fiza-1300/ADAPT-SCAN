@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, type FormEvent } from "react"
-import { login, register, startSimulation, stepSimulation, type BackendState } from "./api"
+import { createSession, login, register, saveSimulationResult, startSimulation, stepSimulation, type BackendState } from "./api"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1350,6 +1350,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (token: string) => v
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem("adapt_scan_token"))
   const [backendSimId, setBackendSimId] = useState<string | null>(null)
+  const [backendSessionId, setBackendSessionId] = useState<string | null>(null)
   const [theme, setTheme] = useState<Theme>("dark")
   const [lang, setLang] = useState<Lang>("en")
   const [aiOpen, setAiOpen] = useState(false)
@@ -1387,21 +1388,30 @@ export default function App() {
   useEffect(() => {
     if (!token) return
     let cancelled = false
-    startSimulation(token, {
-      sim_id: `frontend-${Date.now()}`,
-      scenario: config.scenario,
-      seed: 42,
-      strategy: config.strategy.toLowerCase(),
-      budget_total: config.scanBudget,
-    }).then(state => {
+    async function bootBackend() {
+      const session = await createSession(token, {
+        title: `ADAPT-SCAN ${new Date().toLocaleString()}`,
+        scenario: 2,
+        status: "running",
+        summary: "Frontend-connected simulation session",
+      })
+      const state = await startSimulation(token, {
+        sim_id: `frontend-${Date.now()}`,
+        scenario: config.scenario,
+        seed: 42,
+        strategy: config.strategy.toLowerCase(),
+        budget_total: config.scanBudget,
+      })
       if (cancelled) return
+      setBackendSessionId(session.session._id)
       setBackendSimId(state.sim_id)
       setRegions(mapBackendState(state))
       setStep(state.timestep)
       setBudgetUsed(state.budget_total - state.budget_remaining)
       setRunning(true)
       setBackendError("")
-    }).catch(error => {
+    }
+    bootBackend().catch(error => {
       if (!cancelled) setBackendError(error instanceof Error ? error.message : "Backend simulation could not start.")
     })
     return () => { cancelled = true }
@@ -1451,6 +1461,21 @@ export default function App() {
       setScanningId("backend")
       const state = await stepSimulation(token, backendSimId)
       applyBackendStep(state)
+      const record = buildBackendRecord(state)
+      if (backendSessionId && record) {
+        void saveSimulationResult(token, backendSessionId, {
+          region: record.regionId,
+          strategy: record.strategy,
+          confidence: record.detectedSignal ? 1 : 0,
+          metrics: {
+            information_gain: record.infoGain,
+            threat_value: record.threatValue,
+            uncertainty: record.uncertainty,
+            tracking_urgency: record.trackingUrgency,
+            scan_cost: record.scanCost,
+          },
+        }).catch(error => setBackendError(error instanceof Error ? error.message : "Unable to save simulation result."))
+      }
       setBackendError("")
     } catch (error) {
       setRunning(false)
@@ -1458,7 +1483,7 @@ export default function App() {
     } finally {
       backendRequestRef.current = false
     }
-  }, [applyBackendStep, backendSimId, token])
+  }, [applyBackendStep, backendSessionId, backendSimId, token])
 
   const tick = useCallback(() => {
     if (token && backendSimId) {

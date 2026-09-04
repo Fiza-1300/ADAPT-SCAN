@@ -47,6 +47,10 @@ interface AuthResponse {
   user: { _id: string; name: string; email: string; role: string }
 }
 
+interface SessionResponse {
+  session: { _id: string }
+}
+
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,
@@ -94,5 +98,19 @@ export function resetSimulation(token: string, simId: string) {
   return request<BackendState>('/simulation/reset', {
     method: 'POST',
     body: JSON.stringify({ sim_id: simId }),
+  }, token)
+}
+
+export function createSession(token: string, payload: Record<string, unknown>) {
+  return request<SessionResponse>('/sessions', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }, token)
+}
+
+export function saveSimulationResult(token: string, sessionId: string, payload: Record<string, unknown>) {
+  return request('/sessions/' + sessionId + '/results', {
+    method: 'POST',
+    body: JSON.stringify(payload),
   }, token)
 }
