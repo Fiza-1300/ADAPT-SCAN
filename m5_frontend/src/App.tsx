@@ -1599,6 +1599,8 @@ export default function App() {
   const LANG_LABELS: Record<Lang, string> = { en: "EN", hi: "हि", fr: "FR", es: "ES", de: "DE" }
   const LANG_NAMES: Record<Lang, string> = { en: "English", hi: "हिंदी", fr: "Français", es: "Español", de: "Deutsch" }
 
+  if (!token) return <AuthScreen onAuthenticated={setToken} />
+
   return (
     <div className="h-screen w-full flex flex-col overflow-hidden" style={{ background: c.bg, color: c.textPrimary, fontFamily: "'Inter', sans-serif" }}
       onClick={() => setShowLangMenu(false)}>
