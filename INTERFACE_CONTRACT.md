@@ -1,4 +1,7 @@
+```markdown
+# ADAPT-SCAN Interface Contract
 
+## Data Flow
 
 ## Key Interfaces
 
@@ -13,6 +16,7 @@
     "confidence": 0.72,
     "features": []
 }
+
 {
     "regions": [
         {
@@ -26,6 +30,7 @@
     "budget_remaining": 31.0,
     "timestep": 4
 }
+
 {
     "selected_action": "R7",
     "utility": 0.78,
@@ -34,6 +39,5 @@
     "uncertainty": 0.67,
     "tracking_value": 0.63,
     "scan_cost": 0.12,
-    "reason": "Selected R7 because it has high uncertainty..."
+    "reason": "Selected R7 because it has high uncertainty"
 }
-
