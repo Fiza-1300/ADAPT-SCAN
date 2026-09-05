@@ -1,38 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from "react"
+import { api, type Region, type ScanRecord, type ScanDelta, type DecisionEvent, type Candidate, type ObservationState, type Strategy, type SignalType, type SimConfig } from "./api"
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Local Types ──────────────────────────────────────────────────────────────
 
-type SignalType = "RADAR" | "COMM" | "ECM" | "UNKNOWN" | "SILENT"
-type Strategy = "RANDOM" | "ROUND_ROBIN" | "THREAT_PRIORITY" | "ADAPT_SCAN"
 type Theme = "dark" | "light"
 type Lang = "en" | "hi" | "fr" | "es" | "de"
 type Page = "overview" | "emitters" | "decisions" | "analytics" | "benchmarks" | "settings"
-
-interface Region {
-  id: string; freqMHz: number; bwMHz: number; signalStrength: number
-  threatLevel: number; uncertainty: number; beliefProb: number
-  lastScanned: number; signalType: SignalType; active: boolean; priority: number
-}
-interface ScanRecord {
-  step: number; regionId: string; infoGain: number; threatValue: number
-  uncertainty: number; trackingUrgency: number; scanCost: number
-  detectedSignal: boolean; explanation: string; strategy: Strategy
-}
-interface SimConfig {
-  emitterCount: number; noiseLevel: number; scanBudget: number; scenario: string
-  strategy: Strategy; dynamicEvents: boolean; speed: number
-}
-interface ScanDelta {
-  regionId: string; beliefBefore: number; beliefAfter: number
-  uncBefore: number; uncAfter: number; statusBefore: string; statusAfter: string; detected: boolean
-}
-interface DecisionEvent {
-  id: number; step: number; elapsed: number
-  type: "ai" | "override" | "event"; regionId: string; label: string
-  detected?: boolean; record?: ScanRecord
-}
 interface ChatMsg { role: "user" | "assistant"; text: string }
-interface Candidate { id: string; utility: number; region: Region }
 
 // ─── Theme palettes ───────────────────────────────────────────────────────────
 
@@ -304,7 +278,7 @@ function buildRecord(r: Region, step: number, strategy: Strategy): ScanRecord {
 
 function getTopCandidates(regions: Region[], step: number): Candidate[] {
   return regions
-    .map(r => ({ id: r.id, utility: computeAdaptUtility(r, step), region: r }))
+    .map(r => ({ id: r.id, utility: computeAdaptUtility(r, step), infoGain: 0, threatScore: r.threatLevel, trackingValue: 0, scanCost: 0.1 }))
     .sort((a, b) => b.utility - a.utility)
     .slice(0, 5)
 }
@@ -478,11 +452,6 @@ function DecisionPanel({
   const confidence = Math.round(clamp(0.55 + utilGap * 0.45) * 100)
   const displayUtility = topUtil > 0 ? (topUtil / 10).toFixed(2) : "—"
 
-  const staleness = currentRecord
-    ? (candidates.find(c => c.id === currentRecord.regionId)?.region.lastScanned ?? -1) < 0 ? 1
-      : clamp((step - (candidates.find(c => c.id === currentRecord.regionId)?.region.lastScanned ?? 0)) / 12)
-    : 0
-
   return (
     <div className="w-[300px] shrink-0 flex flex-col border-l overflow-y-auto" style={{ borderColor: c.border, background: c.bgPanel }}>
       {/* Header */}
@@ -572,8 +541,8 @@ function DecisionPanel({
                       {candidates[0].id} OVER {candidates[1].id}
                     </div>
                     {[
-                      { label: "Higher info gain", ok: candidates[0].region.uncertainty > candidates[1].region.uncertainty },
-                      { label: "Greater threat value", ok: candidates[0].region.threatLevel * candidates[0].region.priority > candidates[1].region.threatLevel * candidates[1].region.priority },
+                      { label: "Higher info gain", ok: candidates[0].infoGain > candidates[1].infoGain },
+                      { label: "Greater threat value", ok: candidates[0].threatScore > candidates[1].threatScore },
                       { label: "Comparable scan cost", ok: true },
                       { label: "Superior overall utility", ok: candidates[0].utility > candidates[1].utility * 1.05 },
                     ].map(({ label, ok }) => (
@@ -1010,12 +979,13 @@ function BenchmarksPage({ history, c }: { history: ScanRecord[]; c: Palette }) {
 
 function SettingsPage({
   config, setConfig, running, reset, c,
-  onIntroduceEmitter, onIncreaseNoise, onReduceBudget, onUncSpike, onSignalDisappears, onResetEnv,
+  onIntroduceEmitter, onIncreaseNoise, onReduceBudget, onUncSpike, onSignalDisappears, onResetEnv, onScenarioSelect,
   liveLog,
 }: {
-  config: any; setConfig: any; running: boolean; reset: (s: Strategy) => void; c: Palette
+  config: any; setConfig: any; running: boolean; reset: (s: Strategy, cfg?: any) => void; c: Palette
   onIntroduceEmitter: () => void; onIncreaseNoise: () => void; onReduceBudget: () => void
   onUncSpike: () => void; onSignalDisappears: () => void; onResetEnv: () => void
+  onScenarioSelect: (cfg: any) => void
   liveLog: string[]
 }) {
   return (
@@ -1103,10 +1073,10 @@ function SettingsPage({
         <div>
           <div className="mono text-[9px] tracking-widest font-bold mb-3" style={{ color: c.textMuted }}>SCENARIO PRESETS</div>
           <div className="grid grid-cols-2 gap-2">
-            {SCENARIOS.map(s => (
-              <button key={s.id}
-                onClick={() => { setConfig((c: any) => ({ ...c, ...s.cfg })); setTimeout(() => reset(config.strategy), 50) }}
-                className="rounded border p-3 text-left transition-all"
+             {SCENARIOS.map(s => (
+               <button key={s.id}
+                 onClick={() => onScenarioSelect(s.cfg)}
+                 className="rounded border p-3 text-left transition-all"
                 style={{ background: config.scenario === s.id ? c.accent + "12" : c.bgDarkCard, borderColor: config.scenario === s.id ? c.accent : c.border }}>
                 <div className="mono text-[10px] font-bold" style={{ color: c.textPrimary }}>{s.label}</div>
                 <div className="mono text-[9px] mt-0.5" style={{ color: c.textMuted }}>{s.desc}</div>
@@ -1276,19 +1246,22 @@ export default function App() {
   const [lastDelta, setLastDelta] = useState<ScanDelta | null>(null)
   const [decisionEvents, setDecisionEvents] = useState<DecisionEvent[]>([])
   const [liveLog, setLiveLog] = useState<string[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const eventIdRef = useRef(0)
   const overrideNextRef = useRef<string | null>(null)
   const runSecsRef = useRef(0)
   const lastTickTimeRef = useRef<number | null>(null)
-
-  const c: Palette = theme === "dark" ? DARK : LIGHT
-  const t = (k: TKey) => TRANSLATIONS[lang][k]
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const tickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sessionIdRef = useRef<string | null>(null)
+  const stepInProgressRef = useRef(false)
 
   const [config, setConfig] = useState<SimConfig>({
-    emitterCount: 12, noiseLevel: 0.25, scanBudget: 100, scenario: "DEFAULT",
+    emitterCount: 12, noiseLevel: 0.25, scanBudget: 100, scenario: "NORMAL",
     strategy: "ADAPT_SCAN", dynamicEvents: true, speed: 1200,
   })
-  const [regions, setRegions] = useState<Region[]>(() => initRegions(12))
+  const [regions, setRegions] = useState<Region[]>([])
   const [step, setStep] = useState(0)
   const [scanningId, setScanningId] = useState<string | null>(null)
   const [history, setHistory] = useState<ScanRecord[]>([])
@@ -1296,7 +1269,14 @@ export default function App() {
   const [budgetUsed, setBudgetUsed] = useState(0)
   const [running, setRunning] = useState(false)
   const [candidates, setCandidates] = useState<Candidate[]>([])
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const configRef = useRef(config)
+  const regionsRef = useRef<Region[]>(regions)
+
+  useEffect(() => { configRef.current = config }, [config])
+  useEffect(() => { regionsRef.current = regions }, [regions])
+
+  const c: Palette = theme === "dark" ? DARK : LIGHT
+  const t = (k: TKey) => TRANSLATIONS[lang][k]
 
   // Elapsed timer
   useEffect(() => {
@@ -1315,115 +1295,156 @@ export default function App() {
     setDecisionEvents(evs => [...evs, { id: eventIdRef.current++, step, elapsed: Math.floor(runSecsRef.current), type: "event", regionId: "", label: msg }])
   }
 
-  const tick = useCallback(() => {
-    setStep(s => {
-      const nextStep = s + 1
-      setRegions(prev => {
-        const forceId = overrideNextRef.current
-        if (forceId) overrideNextRef.current = null
-        const nextId = forceId || selectNext(prev, nextStep, config.strategy)
-        const isOverride = !!forceId
-        const prevRegion = prev.find(r => r.id === nextId)!
-
-        setScanningId(nextId)
-        setCandidates(getTopCandidates(prev, nextStep))
-
-        setTimeout(() => {
-          setRegions(regs => regs.map(r => {
-            if (r.id !== nextId) {
-              if (config.dynamicEvents && Math.random() < 0.1)
-                return { ...r, active: Math.random() > 0.35, threatLevel: clamp(r.threatLevel + rng(-0.1, 0.1)) }
-              return r
-            }
-            const detected = r.active && Math.random() > 0.3
-            const beliefAfter = detected ? clamp(r.beliefProb * 0.3 + 0.65) : clamp(r.beliefProb * 0.6)
-            const uncAfter = clamp(r.uncertainty * 0.55 + config.noiseLevel * 0.2)
-            setLastDelta({
-              regionId: nextId, beliefBefore: prevRegion.beliefProb, beliefAfter,
-              uncBefore: prevRegion.uncertainty, uncAfter,
-              statusBefore: getRegionStatus(prevRegion),
-              statusAfter: getRegionStatus({ ...r, beliefProb: beliefAfter, uncertainty: uncAfter }),
-              detected,
-            })
-            return { ...r, lastScanned: nextStep, beliefProb: beliefAfter, uncertainty: uncAfter }
-          }))
-          setRegions(regs => {
-            const region = regs.find(r => r.id === nextId)!
-            const record = buildRecord(region, nextStep, config.strategy)
-            setCurrentRecord(record)
-            setHistory(h => [record, ...h].slice(0, 60))
-            setBudgetUsed(b => b + 1)
-            setScanningId(null)
-            const elapsed = Math.floor(runSecsRef.current)
-            setDecisionEvents(evs => [...evs, {
-              id: eventIdRef.current++, step: nextStep, elapsed,
-              type: isOverride ? "override" : "ai",
-              regionId: nextId,
-              label: isOverride ? `Operator override → ${nextId}` : `AI selected ${nextId} — ${record.detectedSignal ? "HIT" : "NIL"}`,
-              detected: record.detectedSignal, record,
-            }])
-            return regs
-          })
-        }, config.speed * 0.45)
-        return prev
+  const runStep = useCallback(async () => {
+    if (stepInProgressRef.current || !sessionIdRef.current) return
+    stepInProgressRef.current = true
+    setLoading(true)
+    setError(null)
+    try {
+      const overrideId = overrideNextRef.current
+      overrideNextRef.current = null
+      const res = await api.step({
+        session_id: sessionIdRef.current,
+        override_region_id: overrideId || undefined,
       })
-      return nextStep
-    })
-  }, [config])
+      setRegions(res.observation_state.regions)
+      setStep(res.step)
+      setScanningId(res.decision?.region_id || null)
+      setHistory(res.history)
+      setCurrentRecord(res.scan_record)
+      setLastDelta(res.scan_delta)
+      setCandidates(res.candidates)
+      setDecisionEvents(res.decision_events)
+      setBudgetUsed(Math.round(res.observation_state.budget_total - res.observation_state.budget_remaining))
+      if (res.done) {
+        setRunning(false)
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setRunning(false)
+    } finally {
+      setLoading(false)
+      stepInProgressRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
-    if (!running) { if (timerRef.current) clearInterval(timerRef.current); return }
-    timerRef.current = setInterval(tick, config.speed)
-    return () => { if (timerRef.current) clearInterval(timerRef.current) }
-  }, [running, tick, config.speed])
+    if (!running) {
+      if (timerRef.current) clearInterval(timerRef.current)
+      if (tickTimeoutRef.current) clearTimeout(tickTimeoutRef.current)
+      timerRef.current = null
+      tickTimeoutRef.current = null
+      return
+    }
+    timerRef.current = setInterval(runStep, configRef.current.speed)
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current)
+      if (tickTimeoutRef.current) clearTimeout(tickTimeoutRef.current)
+      timerRef.current = null
+      tickTimeoutRef.current = null
+    }
+  }, [running, runStep])
 
-  function reset(strategy: Strategy) {
+  const reset = useCallback(async (strategy: Strategy, configOverride?: Partial<SimConfig>) => {
     if (timerRef.current) clearInterval(timerRef.current)
+    if (tickTimeoutRef.current) clearTimeout(tickTimeoutRef.current)
+    timerRef.current = null
+    tickTimeoutRef.current = null
     setRunning(false)
-    setRegions(initRegions(config.emitterCount))
-    setStep(0); setBudgetUsed(0); setHistory([]); setCurrentRecord(null); setScanningId(null); setLastDelta(null)
-    setConfig(c => ({ ...c, strategy }))
-    setTimeout(() => setRunning(true), 100)
-  }
+    setLoading(true)
+    setError(null)
+    try {
+      const newConfig = { ...configRef.current, strategy, ...configOverride }
+      configRef.current = newConfig
+      const res = await api.reset({
+        scenario: newConfig.scenario,
+        strategy: newConfig.strategy,
+        num_regions: newConfig.emitterCount,
+      })
+      sessionIdRef.current = res.session_id
+      setRegions(res.observation_state.regions)
+      setStep(res.observation_state.timestep)
+      setScanningId(null)
+      setHistory([])
+      setCurrentRecord(null)
+      setLastDelta(null)
+      setCandidates([])
+      setDecisionEvents([])
+      setBudgetUsed(0)
+      setConfig(newConfig)
+      setTimeout(() => setRunning(true), 100)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
-  // Live event handlers
-  function introduceEmitter() {
-    setRegions(regs => {
-      const silent = regs.find(r => !r.active)
-      if (!silent) return regs
-      return regs.map(r => r.id === silent.id ? { ...r, active: true, threatLevel: rng(0.7, 1), uncertainty: 0.92, signalType: Math.random() > 0.5 ? "RADAR" : "ECM" as SignalType } : r)
-    })
-    addLiveEvent("⚡ New emitter introduced")
-  }
-  function increaseNoise() {
-    setConfig(c => ({ ...c, noiseLevel: Math.min(0.95, c.noiseLevel + 0.25) }))
-    addLiveEvent("📡 Noise level increased")
-  }
-  function reduceBudget() {
-    setBudgetUsed(b => Math.min(config.scanBudget - 1, b + Math.round(config.scanBudget * 0.15)))
-    addLiveEvent("💰 Budget reduced by 15%")
-  }
-  function uncertaintySpike() {
-    setRegions(regs => regs.map(r => r.active && Math.random() > 0.5 ? { ...r, uncertainty: Math.min(1, r.uncertainty + rng(0.2, 0.4)) } : r))
-    addLiveEvent("⚠ Uncertainty spike detected")
-  }
-  function signalDisappears() {
-    setRegions(regs => {
-      const tracked = regs.filter(r => r.active && r.beliefProb > 0.5)
-      if (!tracked.length) return regs
-      const victim = tracked[Math.floor(Math.random() * tracked.length)]
-      return regs.map(r => r.id === victim.id ? { ...r, active: false, beliefProb: 0.15, uncertainty: 0.85 } : r)
-    })
-    addLiveEvent("👻 Signal disappeared")
-  }
+  const introduceEmitter = useCallback(async () => {
+    if (!sessionIdRef.current) return
+    try {
+      await api.triggerEvent(sessionIdRef.current, "introduce_emitter")
+      addLiveEvent("⚡ New emitter introduced")
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [])
+
+  const increaseNoise = useCallback(async () => {
+    if (!sessionIdRef.current) return
+    try {
+      await api.triggerEvent(sessionIdRef.current, "increase_noise")
+      addLiveEvent("📡 Noise level increased")
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [])
+
+  const reduceBudget = useCallback(async () => {
+    if (!sessionIdRef.current) return
+    try {
+      await api.triggerEvent(sessionIdRef.current, "reduce_budget")
+      addLiveEvent("💰 Budget reduced by 15%")
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [])
+
+  const uncertaintySpike = useCallback(async () => {
+    if (!sessionIdRef.current) return
+    try {
+      await api.triggerEvent(sessionIdRef.current, "uncertainty_spike")
+      addLiveEvent("⚠ Uncertainty spike detected")
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [])
+
+  const signalDisappears = useCallback(async () => {
+    if (!sessionIdRef.current) return
+    try {
+      await api.triggerEvent(sessionIdRef.current, "signal_disappears")
+      addLiveEvent("👻 Signal disappeared")
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [])
 
   const detected = regions.filter(r => r.beliefProb > 0.6 && r.active).length
   const highPriority = regions.filter(r => r.threatLevel > 0.7 && r.beliefProb > 0.5).length
   const uncertain = regions.filter(r => r.uncertainty > 0.65).length
-  const budgetPct = Math.round((budgetUsed / config.scanBudget) * 100)
+  const budgetPct = config.scanBudget > 0 ? Math.round((budgetUsed / config.scanBudget) * 100) : 0
 
   const LANG_LABELS: Record<Lang, string> = { en: "EN", hi: "हि", fr: "FR", es: "ES", de: "DE" }
   const LANG_NAMES: Record<Lang, string> = { en: "English", hi: "हिंदी", fr: "Français", es: "Español", de: "Deutsch" }
+
+  const handleRunToggle = useCallback(() => {
+    if (!running && !sessionIdRef.current) {
+      reset(configRef.current.strategy)
+      return
+    }
+    setRunning(r => !r)
+  }, [running, reset])
 
   return (
     <div className="h-screen w-full flex flex-col overflow-hidden" style={{ background: c.bg, color: c.textPrimary, fontFamily: "'Inter', sans-serif" }}
@@ -1486,13 +1507,21 @@ export default function App() {
             ⬡ AI
           </button>
           {/* Run/Pause */}
-          <button onClick={() => setRunning(r => !r)}
+          <button onClick={handleRunToggle}
             className="px-3 py-1 rounded border mono text-xs font-bold"
             style={running ? { background: c.bgDarkCard, borderColor: c.yellow, color: c.yellow } : { background: c.accent + "22", borderColor: c.accent, color: c.accent }}>
             {running ? t("pause") : t("run")}
           </button>
         </div>
       </header>
+
+      {error && (
+        <div className="px-4 py-2 border-b text-xs mono flex items-center justify-between shrink-0"
+          style={{ background: c.red + "22", color: c.red, borderColor: c.red + "44" }}>
+          <span>⚠ {error}</span>
+          <button onClick={() => setError(null)} className="px-2 py-0.5 rounded border" style={{ borderColor: c.red + "44", color: c.red }}>✕</button>
+        </div>
+      )}
 
       {/* ── Body ── */}
       <div className="flex flex-1 overflow-hidden">
@@ -1590,7 +1619,8 @@ export default function App() {
           <SettingsPage config={config} setConfig={setConfig} running={running} reset={reset} c={c}
             onIntroduceEmitter={introduceEmitter} onIncreaseNoise={increaseNoise}
             onReduceBudget={reduceBudget} onUncSpike={uncertaintySpike}
-            onSignalDisappears={signalDisappears} onResetEnv={() => reset(config.strategy)}
+            onSignalDisappears={signalDisappears} onResetEnv={() => reset(configRef.current.strategy)}
+            onScenarioSelect={(cfg) => reset(configRef.current.strategy, cfg)}
             liveLog={liveLog} />
         )}
       </div>
